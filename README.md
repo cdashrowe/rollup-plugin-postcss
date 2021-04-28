@@ -12,12 +12,16 @@ Seamless integration between [Rollup](https://github.com/rollup/rollup) and [Pos
 ## Install
 
 ```bash
-yarn add rollup-plugin-postcss --dev
+yarn add postcss rollup-plugin-postcss --dev
 ```
 
 ## Usage
 
-You are viewing the docs for `v2.0` which only support Rollup 1.0 or above.
+`v2.0` support rollup v1 or above, but it prints deprecated warning from rollup v2.
+
+**Breaking change**: `v3.0` only support rollup v2, and the extract path based on bundle root
+ the location of the generated file outside the bundle directory not allowed in rollup v2.
+
 ```js
 // rollup.config.js
 import postcss from 'rollup-plugin-postcss'
@@ -49,8 +53,19 @@ It will also automatically use local PostCSS config files.
 ### Extract CSS
 
 ```js
+// for v2
 postcss({
-  extract: true
+  extract: true,
+  // Or with custom file name, it will generate file relative to bundle.js in v3
+  extract: 'dist/my-custom-file-name.css'
+})
+
+// for v3
+import path from 'path'
+postcss({
+  extract: true,
+  // Or with custom file name
+  extract: path.resolve('dist/my-custom-file-name.css')
 })
 ```
 
@@ -101,12 +116,15 @@ PostCSS Plugins.
 
 ### inject
 
-Type: `boolean` `object`<br>
+Type: `boolean` `object` `function(cssVariableName, fileId): string`
+
 Default: `true`
 
 Inject CSS into `<head>`, it's always `false` when `extract: true`.
 
 You can also use it as options for [`style-inject`](https://github.com/egoist/style-inject#options).
+
+It can also be a `function` , returning a `string` which is js code.
 
 ### extract
 
@@ -223,7 +241,7 @@ Type: `object`
 
 [`ctx`](https://github.com/michael-ciniawsky/postcss-load-config#context) argument for PostCSS config file.
 
-Note: Every keys you pass to `config.ctx` will be available under `options` inside
+Note: Every key you pass to `config.ctx` will be available under `options` inside
 the postcss config.
 
 ```js
@@ -244,9 +262,17 @@ module.exports = context => {
 }
 ```
 
+### to
+
+Type: `string`
+
+Destination CSS filename hint that could be used by PostCSS plugins, for example, 
+to properly resolve path, rebase and copy assets.
+
 ### use
 
-Type: `name[]` `[name, options][]`<br>
+Type: `name[]` `[name, options][]` `{ sass: options, stylus: options, less: options }`
+
 Default: `['sass', 'stylus', 'less']`
 
 Use a loader, currently built-in loaders are:
@@ -256,6 +282,9 @@ Use a loader, currently built-in loaders are:
 - `less` (Support `.less`)
 
 They are executed from right to left.
+
+If you pass the `object`, then its property `sass`, `stylus` and `less` will
+be pass in the corresponding loader.
 
 ### loaders
 

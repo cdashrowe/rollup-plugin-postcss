@@ -4,6 +4,10 @@ import { rollup } from 'rollup'
 import postcss from '../src'
 
 process.env.ROLLUP_POSTCSS_TEST = true
+/**
+ * solve jest timeout on Windows OS
+ */
+const JEST_TIMEOUT = process.platform === 'win32' ? 20000 : 5000
 
 function fixture(...args) {
   return path.join(__dirname, 'fixtures', ...args)
@@ -16,18 +20,43 @@ async function write({
   outDir,
   options
 }) {
+  const { delayResolve, ...postCssOptions } = options
+
+  let first = true
+  // Delay the resolving of the first css file
+  const lateResolve = {
+    name: 'late-resolve',
+    async resolveId(importee) {
+      // when it's not a css file and not the first css file we return
+      if (!first || !importee.endsWith('.css')) {
+        return null
+      }
+
+      first = false
+
+      // delay resolving
+      return new Promise(resolve => {
+        setTimeout(() => resolve(null), 1000)
+      })
+    }
+  }
+
   outDir = fixture('dist', outDir)
   const bundle = await rollup({
     input: fixture(input),
-    plugins: [
-      postcss(options)
-    ]
+    plugins: [postcss(postCssOptions), delayResolve && lateResolve].filter(
+      Boolean
+    )
   })
   await bundle.write({
     format: 'cjs',
     file: path.join(outDir, 'bundle.js')
   })
-  const cssCodePath = typeof options.extract === 'string' ? options.extract : path.join(outDir, 'bundle.css')
+  let cssCodePath = path.join(outDir, 'bundle.css')
+  if (typeof options.extract === 'string') {
+    cssCodePath = path.isAbsolute(options.extract) ? options.extract : path.join(outDir, options.extract)
+  }
+
   const cssMapPath = `${cssCodePath}.map`
   const jsCodePath = path.join(outDir, 'bundle.js')
   return {
@@ -56,38 +85,39 @@ function snapshot({
   options = {}
 }) {
   test(title, async () => {
-    let res
+    let result
     try {
-      res = await write({
+      result = await write({
         input,
         outDir,
         options
       })
-    } catch (err) {
-      const frame = err.codeFrame || err.snippet
+    } catch (error) {
+      const frame = error.codeFrame || error.snippet
       if (frame) {
-        throw new Error(frame + err.message)
+        throw new Error(frame + error.message)
       }
-      throw err
+
+      throw error
     }
 
-    expect(await res.jsCode()).toMatchSnapshot('js code')
+    expect(await result.jsCode()).toMatchSnapshot('js code')
 
     if (options.extract) {
-      expect(await res.hasCssFile()).toBe(true)
-      expect(await res.cssCode()).toMatchSnapshot('css code')
+      expect(await result.hasCssFile()).toBe(true)
+      expect(await result.cssCode()).toMatchSnapshot('css code')
     }
 
     const sourceMap = options && options.sourceMap
     if (sourceMap === 'inline') {
-      expect(await res.hasCssMapFile()).toBe(false)
+      expect(await result.hasCssMapFile()).toBe(false)
     } else if (sourceMap === true) {
-      expect(await res.hasCssMapFile()).toBe(Boolean(options.extract))
+      expect(await result.hasCssMapFile()).toBe(Boolean(options.extract))
       if (options.extract) {
-        expect(await res.cssMap()).toMatchSnapshot('css map')
+        expect(await result.cssMap()).toMatchSnapshot('css map')
       }
     }
-  })
+  }, JEST_TIMEOUT)
 }
 
 function snapshotMany(title, tests) {
@@ -133,6 +163,13 @@ snapshotMany('basic', [
       plugins: [
         require('autoprefixer')()
       ]
+    }
+  },
+  {
+    title: 'on-import',
+    input: 'simple/index.js',
+    options: {
+      onImport: () => { }
     }
   }
 ])
@@ -185,6 +222,7 @@ snapshotMany('modules', [
     title: 'inject-object',
     input: 'css-modules/index.js',
     options: {
+      autoModules: false,
       modules: {
         getJSON() {
           //
@@ -259,6 +297,14 @@ snapshotMany('extract', [
     }
   },
   {
+    title: 'relative-path',
+    input: 'simple/index.js',
+    options: {
+      extract: 'this/is/extracted.css',
+      sourceMap: true
+    }
+  },
+  {
     title: 'sourcemap-true',
     input: 'simple/index.js',
     options: {
@@ -273,6 +319,23 @@ snapshotMany('extract', [
       sourceMap: 'inline',
       extract: true
     }
+  },
+  {
+    title: 'nested',
+    input: 'nested/index.js',
+    options: {
+      sourceMap: 'inline',
+      extract: true
+    }
+  },
+  {
+    title: 'nested-delay-resolve',
+    input: 'nested/index.js',
+    options: {
+      sourceMap: 'inline',
+      extract: true,
+      delayResolve: true
+    }
   }
 ])
 
@@ -284,6 +347,13 @@ snapshotMany('inject', [
       inject: {
         insertAt: 'top'
       }
+    }
+  },
+  {
+    title: 'function',
+    input: 'simple/index.js',
+    options: {
+      inject: variableName => `console.log(${variableName})`
     }
   },
   {
@@ -315,13 +385,34 @@ snapshotMany('sass', [
     }
   },
   {
+    title: 'data-prepend',
+    input: 'sass-data-prepend/index.js',
+    options: {
+      use: [
+        [
+          'sass',
+          { data: '@import \'prepend\';' }
+        ]
+      ]
+    }
+  },
+  {
+    title: 'data-prepend',
+    input: 'sass-data-prepend/index.js',
+    options: {
+      use: {
+        sass: { data: '@import \'prepend\';' }
+      }
+    }
+  },
+  {
     title: 'import',
     input: 'sass-import/index.js'
   }
 ])
 
 test('onExtract', async () => {
-  const res = await write({
+  const result = await write({
     input: 'simple/index.js',
     outDir: 'onExtract',
     options: {
@@ -331,6 +422,35 @@ test('onExtract', async () => {
       }
     }
   })
-  expect(await res.jsCode()).toMatchSnapshot()
-  expect(await res.hasCssFile()).toBe(false)
+  expect(await result.jsCode()).toMatchSnapshot()
+  expect(await result.hasCssFile()).toBe(false)
+})
+
+test('augmentChunkHash', async () => {
+  const outDir = fixture('dist', 'augmentChunkHash')
+  const cssFiles = ['simple/foo.css', 'simple/foo.css', 'simple/bar.css']
+
+  const outputFiles = []
+  /* eslint-disable no-await-in-loop */
+  for (const file of cssFiles) {
+    const newBundle = await rollup({
+      input: fixture(file),
+      plugins: [postcss({ extract: true })]
+    })
+    const entryFileName = file.split('.')[0]
+    const { output } = await newBundle.write({
+      dir: outDir,
+      entryFileNames: `${entryFileName}.[hash].css`
+    })
+    outputFiles.push(output[0])
+  }
+
+  const [fooOne, fooTwo, barOne] = outputFiles
+
+  const fooHash = fooOne.fileName.split('.')[1]
+  expect(fooHash).toBeTruthy() // Verify that [hash] part of `foo.[hash].css` is truthy
+  expect(fooOne.fileName).toEqual(fooTwo.fileName) // Verify that the foo hashes to the same fileName
+
+  const barHash = barOne.fileName.split('.')[1]
+  expect(barHash).not.toEqual(fooHash) // Verify that foo and bar does not hash to the same
 })

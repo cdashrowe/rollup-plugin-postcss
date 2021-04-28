@@ -2,6 +2,7 @@ import path from 'path'
 import { createFilter } from 'rollup-pluginutils'
 import Concat from 'concat-with-sourcemaps'
 import Loaders from './loaders'
+import normalizePath from './utils/normalize-path'
 
 /**
  * The options that could be `boolean` or `object`
@@ -14,18 +15,43 @@ function inferOption(option, defaultValue) {
   return option ? {} : defaultValue
 }
 
+/**
+ * Recursively get the correct import order from rollup
+ * We only process a file once
+ *
+ * @param {string} id
+ * @param {Function} getModuleInfo
+ * @param {Set<string>} seen
+ */
+function getRecursiveImportOrder(id, getModuleInfo, seen = new Set()) {
+  if (seen.has(id)) {
+    return []
+  }
+
+  seen.add(id)
+
+  const result = [id]
+  getModuleInfo(id).importedIds.forEach(importFile => {
+    result.push(...getRecursiveImportOrder(importFile, getModuleInfo, seen))
+  })
+
+  return result
+}
+
+/* eslint import/no-anonymous-default-export: [2, {"allowArrowFunction": true}] */
 export default (options = {}) => {
   const filter = createFilter(options.include, options.exclude)
   const postcssPlugins = Array.isArray(options.plugins) ?
     options.plugins.filter(Boolean) :
     options.plugins
-  const sourceMap = options.sourceMap
+  const { sourceMap } = options
   const postcssLoaderOptions = {
     /** Inject CSS as `<style>` to `<head>` */
-    inject: inferOption(options.inject, {}),
+    inject: typeof options.inject === 'function' ? options.inject : inferOption(options.inject, {}),
     /** Extract CSS */
     extract: typeof options.extract === 'undefined' ? false : options.extract,
     /** CSS modules */
+    onlyModules: options.modules === true,
     modules: inferOption(options.modules, false),
     namedExports: options.namedExports,
     /** Automatically CSS modules for .module.xxx files */
@@ -34,6 +60,8 @@ export default (options = {}) => {
     minimize: inferOption(options.minimize, false),
     /** Postcss config file */
     config: inferOption(options.config, {}),
+    /** PostCSS target filename hint, for plugins that are relying on it */
+    to: options.to,
     /** PostCSS options */
     postcss: {
       parser: options.parser,
@@ -43,7 +71,17 @@ export default (options = {}) => {
       exec: options.exec
     }
   }
-  const use = options.use || ['sass', 'stylus', 'less']
+  let use = ['sass', 'stylus', 'less']
+  if (Array.isArray(options.use)) {
+    use = options.use
+  } else if (options.use !== null && typeof options.use === 'object') {
+    use = [
+      ['sass', options.use.sass || {}],
+      ['stylus', options.use.stylus || {}],
+      ['less', options.use.less || {}]
+    ]
+  }
+
   use.unshift(['postcss', postcssLoaderOptions])
 
   const loaders = new Loaders({
@@ -74,7 +112,7 @@ export default (options = {}) => {
         plugin: this
       }
 
-      const res = await loaders.process(
+      const result = await loaders.process(
         {
           code,
           map: undefined
@@ -87,53 +125,76 @@ export default (options = {}) => {
       }
 
       if (postcssLoaderOptions.extract) {
-        extracted.set(id, res.extracted)
+        extracted.set(id, result.extracted)
         return {
-          code: res.code,
+          code: result.code,
           map: { mappings: '' }
         }
       }
 
       return {
-        code: res.code,
-        map: res.map || { mappings: '' }
+        code: result.code,
+        map: result.map || { mappings: '' }
       }
     },
 
-    async generateBundle(opts, bundle) {
+    augmentChunkHash() {
       if (extracted.size === 0) return
+      // eslint-disable-next-line unicorn/no-reduce
+      const extractedValue = [...extracted].reduce((object, [key, value]) => ({
+        ...object,
+        [key]: value
+      }), {})
+      return JSON.stringify(extractedValue)
+    },
 
+    async generateBundle(options_, bundle) {
+      if (
+        extracted.size === 0 ||
+        !(options_.dir || options_.file)
+      ) return
+
+      // eslint-disable-next-line no-warning-comments
       // TODO: support `[hash]`
-      const dir = opts.dir || path.dirname(opts.file)
+      const dir = options_.dir || path.dirname(options_.file)
       const file =
-        opts.file ||
+        options_.file ||
         path.join(
-          opts.dir,
+          options_.dir,
           Object.keys(bundle).find(fileName => bundle[fileName].isEntry)
         )
       const getExtracted = () => {
-        const fileName =
-          typeof postcssLoaderOptions.extract === 'string' ?
-            path.relative(dir, postcssLoaderOptions.extract) :
-            `${path.basename(file, path.extname(file))}.css`
+        let fileName = `${path.basename(file, path.extname(file))}.css`
+        if (typeof postcssLoaderOptions.extract === 'string') {
+          fileName = path.isAbsolute(postcssLoaderOptions.extract) ? normalizePath(path.relative(dir, postcssLoaderOptions.extract)) : normalizePath(postcssLoaderOptions.extract)
+        }
+
         const concat = new Concat(true, fileName, '\n')
-        const entries = Array.from(extracted.values())
-        const { modules } = bundle[path.relative(dir, file)]
+        const entries = [...extracted.values()]
+        const { modules, facadeModuleId } = bundle[
+          normalizePath(path.relative(dir, file))
+        ]
 
         if (modules) {
-          const fileList = Object.keys(modules)
+          const moduleIds = getRecursiveImportOrder(
+            facadeModuleId,
+            this.getModuleInfo
+          )
           entries.sort(
-            (a, b) => fileList.indexOf(a.id) - fileList.indexOf(b.id)
+            (a, b) => moduleIds.indexOf(a.id) - moduleIds.indexOf(b.id)
           )
         }
-        for (const res of entries) {
-          const relative = path.relative(dir, res.id)
-          const map = res.map || null
+
+        for (const result of entries) {
+          const relative = normalizePath(path.relative(dir, result.id))
+          const map = result.map || null
           if (map) {
             map.file = fileName
           }
-          concat.add(relative, res.code, map)
+
+          concat.add(relative, result.code, map)
         }
+
         let code = concat.content
 
         if (sourceMap === 'inline') {
@@ -142,7 +203,7 @@ export default (options = {}) => {
             'utf8'
           ).toString('base64')}*/`
         } else if (sourceMap === true) {
-          code += `\n/*# sourceMappingURL=${fileName}.map */`
+          code += `\n/*# sourceMappingURL=${path.basename(fileName)}.map */`
         }
 
         return {
@@ -163,16 +224,16 @@ export default (options = {}) => {
       let { code, codeFileName, map, mapFileName } = getExtracted()
       // Perform cssnano on the extracted file
       if (postcssLoaderOptions.minimize) {
-        const cssOpts = postcssLoaderOptions.minimize
-        cssOpts.from = codeFileName
+        const cssOptions = postcssLoaderOptions.minimize
+        cssOptions.from = codeFileName
         if (sourceMap === 'inline') {
-          cssOpts.map = { inline: true }
+          cssOptions.map = { inline: true }
         } else if (sourceMap === true && map) {
-          cssOpts.map = { prev: map }
-          cssOpts.to = codeFileName
+          cssOptions.map = { prev: map }
+          cssOptions.to = codeFileName
         }
 
-        const result = await require('cssnano').process(code, cssOpts)
+        const result = await require('cssnano').process(code, cssOptions)
         code = result.css
 
         if (sourceMap === true && result.map && result.map.toString) {
@@ -180,19 +241,17 @@ export default (options = {}) => {
         }
       }
 
-      const codeFile = {
+      this.emitFile({
         fileName: codeFileName,
-        isAsset: true,
+        type: 'asset',
         source: code
-      }
-      bundle[codeFile.fileName] = codeFile
+      })
       if (map) {
-        const mapFile = {
+        this.emitFile({
           fileName: mapFileName,
-          isAsset: true,
+          type: 'asset',
           source: map
-        }
-        bundle[mapFile.fileName] = mapFile
+        })
       }
     }
   }
